@@ -2162,6 +2162,9 @@ class GatewayTurnMixin(GatewayTurnRoutingMixin):
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                internal=bool(
+                    getattr(event, "internal", False) or getattr(event, "_heartbeat_session_id", None)
+                ),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -4188,6 +4191,7 @@ class GatewayTurnMixin(GatewayTurnRoutingMixin):
         persist_user_display_metadata: Optional[dict] = None,
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
+        internal: bool = False,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4226,6 +4230,7 @@ class GatewayTurnMixin(GatewayTurnRoutingMixin):
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata,
             scheduled_heartbeat=scheduled_heartbeat,
+            internal=internal,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
