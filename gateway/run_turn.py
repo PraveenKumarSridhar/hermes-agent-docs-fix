@@ -2397,7 +2397,7 @@ class GatewayTurnMixin(GatewayTurnRoutingMixin):
             reasoning_config = self._resolve_session_reasoning_config(source=source, model=model)
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs, internal=True)
 
             # Enrich the prompt with image descriptions (same as the main flow).
             enriched_prompt = prompt
