@@ -1005,13 +1005,27 @@ def _deferred_build_agent_kwargs(current: dict, session_db) -> dict:
         kw["session_id"] = resume_sid
     resume_overrides = current.get("resume_runtime_overrides")
     if isinstance(resume_overrides, dict) and resume_overrides and _overrides_have_routable_provider(resume_overrides):
-        kw.update(resume_overrides)
+        kw.update({
+            key: value for key, value in resume_overrides.items()
+            if key not in {
+                "turn_route_binding", "turn_route_pending",
+                "reasoning_config_override", "service_tier_override",
+            }
+        })
     else:
         if override := current.get("model_override"):
             kw["model_override"] = override
-        kw.update({k: v for k, v in (("reasoning_config_override", current.get("create_reasoning_override")),
-                                     ("service_tier_override", current.get("create_service_tier_override")))
-                   if v is not None})
+    for override_key, create_key in (
+        ("reasoning_config_override", "create_reasoning_override"),
+        ("service_tier_override", "create_service_tier_override"),
+    ):
+        value = (
+            resume_overrides.get(override_key)
+            if isinstance(resume_overrides, dict) and override_key in resume_overrides
+            else current.get(create_key)
+        )
+        if value is not None:
+            kw[override_key] = value
     return kw
 
 
@@ -1113,6 +1127,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
             str(session.get("session_key") or ""), session.get("profile_home") or None):
         return
     with session.setdefault("agent_build_lock", threading.Lock()):
+        # A first-message router needs the prompt before it can choose a runtime. Every build entry point
+        # shares this lock, so prewarm timers and attachment RPCs cannot race ahead of that decision.
+        if session.get("turn_route_pending"):
+            return
         if ready.is_set() or session.get("agent_build_started"):
             return
         session["agent_build_started"] = True
@@ -1192,6 +1210,8 @@ def _sess_nowait(params, rid):
 
 def _sess(params, rid):
     s, err = _sess_building(params, rid)
+    if not err and s.get("turn_route_pending"):
+        return None, _err(rid, 5036, "the first prompt must select this session's route before agent initialization")
     return (None, err) if err else (s, _wait_agent(s, rid))
 
 
@@ -1200,7 +1220,7 @@ def _sess_building(params, rid):
     clipboard.paste, image.detach), which only touch creation-time fields and run inline on the socket
     reader thread, where waiting on a cold build stalled every RPC behind it ("text is instant, images hang")."""
     s, err = _sess_nowait(params, rid)
-    if not err:
+    if not err and not s.get("turn_route_pending"):
         _start_agent_build(params.get("session_id") or "", s)
     return (None, err) if err else (s, None)
 
@@ -1600,6 +1620,29 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         overrides["reasoning_config_override"] = reasoning_config
     if service_tier:  # None = "inherit the profile" at _make_agent; "" = real override "no priority tier"
         overrides["service_tier_override"] = "" if service_tier.lower() == "normal" else service_tier
+    if isinstance(binding := model_config.get("turn_route_binding"), dict):
+        binding_model = str(binding.get("model") or "").strip()
+        binding_provider = str(
+            binding.get("requested_provider") or binding.get("provider") or "").strip()
+        # Heal rows written by an older messaging gateway that changed runtime
+        # authority but retained a stale Desktop binding.
+        gateway_runtime = model_config.get("gateway_runtime")
+        mismatched_gateway_binding = bool(
+            isinstance(gateway_runtime, dict)
+            and (
+                (binding_model and binding_model != model)
+                or (binding_provider and provider and binding_provider != provider)
+            )
+        )
+        if not mismatched_gateway_binding:
+            overrides["turn_route_binding"] = binding
+    elif model_config.get("turn_route_pending") is True:
+        overrides["turn_route_pending"] = True
+        # A pending row has no chosen route. Its row model is the creation-time
+        # default, not an explicit user override, so the first prompt must still
+        # reach turn-route middleware after a cold resume.
+        overrides.pop("model_override", None)
+        overrides.pop("provider_override", None)
     return overrides
 
 
@@ -1633,11 +1676,11 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     return config
 
 
-def _persist_live_session_runtime(session: dict | None) -> None:
+def _persist_live_session_runtime(session: dict | None) -> bool:
     """Persist active session runtime so future resumes restore the same footer."""
     live = _live_session_agent_db(session)
     if live is None:
-        return
+        return False
     agent, session_key, db = live
     try:
         row = db.get_session(session_key) or {}
@@ -1649,13 +1692,25 @@ def _persist_live_session_runtime(session: dict | None) -> None:
         if (tier_override := session.get("create_service_tier_override")) is not None:
             # agent.service_tier is None for explicit normal; without this the distinction is erased on every persist.
             model_config["service_tier"] = tier_override or "normal"
+        if safe := _safe_binding(session.get("turn_route_binding")):
+            model_config["turn_route_binding"] = safe
+            model_config.pop("turn_route_pending", None)
+            model_config.pop("gateway_runtime", None)
+        elif session.get("turn_route_pending"):
+            model_config["turn_route_pending"] = True
+        else:
+            model_config.pop("turn_route_pending", None)
         model = str(getattr(agent, "model", "") or "").strip()
         if hasattr(db, "update_session_meta"):
             db.update_session_meta(session_key, json.dumps(model_config), model or None)
         elif model and hasattr(db, "update_session_model"):
             db.update_session_model(session_key, model)
+        else:
+            return False
+        return True
     except Exception:
         logger.debug("failed to persist live session runtime", exc_info=True)
+        return False
 
 
 def _live_session_agent_db(session: dict | None):
@@ -2413,7 +2468,9 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _Runti
         raise
 
 
-def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str, dict]:
+def _resolve_agent_model_runtime(
+    model_override, provider_override, *, allow_configured_fallback: bool = True,
+) -> tuple[str, dict]:
     """(model, runtime) for a new agent; a per-session override (/model switch or a resumed row's persisted
     runtime) wins over global config/env. Older rows stored the resolved provider "custom" (no named entry
     matches) — recover the identity from the persisted base_url or the rebuild fails "No LLM provider
@@ -2440,7 +2497,12 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
             requested_provider = provider_override
         resolve_kwargs = {"requested": requested_provider, "target_model": model or None}
         overrides = {}
-    resolution = _resolve_runtime_with_fallback(resolve_kwargs)
+    if allow_configured_fallback:
+        resolution = _resolve_runtime_with_fallback(resolve_kwargs)
+    else:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        resolution = _RuntimeFallbackResolution(
+            resolve_runtime_provider(**resolve_kwargs), None, False)
     if resolution.used_fallback:
         if not resolution.selected_model:
             raise RuntimeError("Auth fallback resolved without a model")
@@ -2461,6 +2523,16 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
     if any(overrides.values()):
         _rederive_per_model_route(model, resolution.runtime)
     return model, resolution.runtime
+
+
+def _resolve_agent_model_runtime_strict(model_override, provider_override) -> tuple[str, dict]:
+    """Resolve the requested route without consuming the operational fallback chain.
+
+    First-turn routing records policy intent. Provider fallback remains an execution-time
+    decision in ``_make_agent`` so it can be retried later and its user notice is preserved.
+    """
+    return _resolve_agent_model_runtime(
+        model_override, provider_override, allow_configured_fallback=False)
 
 
 def _rederive_per_model_route(model: str, runtime: dict) -> None:
@@ -2687,7 +2759,8 @@ def _deferred_session_record(
     close_on_disconnect: bool = False, display_history_prefix: list | None = None,
     profile_home: Path | None = None, lazy: bool = False, model_override=None,
     resume_runtime_overrides: dict | None = None, todo_state: dict | None = None,
-    explicit_cwd: bool = False) -> dict:
+    explicit_cwd: bool = False, turn_route_binding: dict | None = None,
+    turn_route_pending: bool = False) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold resume) — _init_session's shape minus the agent."""
     now = time.time()
     return {
@@ -2700,6 +2773,7 @@ def _deferred_session_record(
         "pending_title": None,
         "profile_home": str(profile_home) if profile_home is not None else None,
         "resume_runtime_overrides": resume_runtime_overrides, "resume_session_id": session_key,
+        "turn_route_binding": turn_route_binding, "turn_route_pending": bool(turn_route_pending),
         "running": False, "session_key": session_key, "show_reasoning": _load_show_reasoning(),
         "slash_worker": None, "source": source, "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {}, "todo_state": todo_state,
@@ -3473,7 +3547,8 @@ from . import (  # noqa: E402
     agent_callbacks as _agent_callbacks, session_history as _session_history,
     prompt_attachments as _prompt_attachments, session_notifications as _session_notifications,
     tool_progress as _tool_progress, change_watcher as _change_watcher,
-    session_compression as _session_compression, model_switch as _model_switch,
+    session_compression as _session_compression, methods_turn_route as _methods_turn_route,
+    model_switch as _model_switch,
     compute_host_bridge as _compute_host_bridge, session_workdir as _session_workdir,
     session_lifecycle as _session_lifecycle, session_reaper as _session_reaper,
     session_transports as _session_transports,
@@ -3491,7 +3566,8 @@ from . import (  # noqa: E402
     methods_shared_metrics as _methods_shared_metrics)
 
 for _m in (
-    _session_transports, _session_reaper, _session_lifecycle, _session_workdir, _compute_host_bridge, _model_switch,
+    _session_transports, _session_reaper, _session_lifecycle, _session_workdir, _compute_host_bridge,
+    _methods_turn_route, _model_switch,
     _session_compression, _change_watcher, _tool_progress, _session_notifications,
     _prompt_attachments, _session_history, _agent_callbacks, _session_auto_continue, _plugin_inject, _rpc_dispatch,
     _methods_complete_helpers, _methods_slash, _methods_voice, _methods_browser,

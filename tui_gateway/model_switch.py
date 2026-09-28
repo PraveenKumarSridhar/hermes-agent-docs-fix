@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import threading
 
 from .method_ctx import HandlerRegistry, bind_module
 
@@ -264,8 +265,38 @@ def _expensive_model_confirm(result, current_base_url: str, current_api_key, age
     return {"value": result.new_model, "warning": msg, "confirm_required": True, "confirm_message": msg}
 
 
-def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: str, snapshot):
-    """Swap the live agent in place, then restart/persist/mark/announce; a failed swap aborts."""
+def _finalize_agent_switch(
+    sid: str,
+    session: dict,
+    result,
+    snapshot,
+    *,
+    persist_runtime: bool = True,
+) -> None:
+    """Run post-swap effects after any route-binding transaction has committed."""
+    _restart_slash_worker(sid, session)
+    if persist_runtime:
+        _persist_live_session_runtime(session)
+    _persist_live_session_system_prompt(session)
+    _append_model_switch_marker(session, model=result.new_model, provider=result.target_provider)
+    _emit_session_info(sid, session)
+    if snapshot is not None:
+        session["one_turn_model_restore"] = snapshot
+    else:
+        session.pop("one_turn_model_restore", None)
+
+
+def _commit_agent_switch(
+    sid: str,
+    session: dict,
+    agent,
+    result,
+    current_model: str,
+    snapshot,
+    *,
+    finalize: bool = True,
+):
+    """Swap the live agent, optionally deferring effects until route persistence commits."""
     try:
         agent.switch_model(
             new_model=result.new_model, new_provider=result.target_provider, api_key=result.api_key,
@@ -281,23 +312,54 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
         logger.warning("In-place model switch failed for TUI agent: %s", exc)
         raise ValueError(f"Model switch to {result.new_model} failed ({exc}); "
                          f"staying on {getattr(agent, 'model', current_model)}.") from exc
-    _restart_slash_worker(sid, session)
-    _persist_live_session_runtime(session)
-    _persist_live_session_system_prompt(session)
-    _append_model_switch_marker(session, model=result.new_model, provider=result.target_provider)
-    _emit_session_info(sid, session)
-    if snapshot is not None:
-        session["one_turn_model_restore"] = snapshot
-    else:
-        session.pop("one_turn_model_restore", None)
+    if finalize:
+        _finalize_agent_switch(sid, session, result, snapshot)
 
 
 def _apply_model_switch(
     sid: str, session: dict, raw_input: str, *, confirm_expensive_model: bool = False,
     pin_session_override: bool = True, parsed_flags: Any | None = None,
-    persist_override: bool | None = None, count_switch: bool = True) -> dict:
+    persist_override: bool | None = None, count_switch: bool = True,
+    _prebuild_locked: bool = False) -> dict:
     """``count_switch=False``: an internal swap (config adoption, MoA one-shot and its restore), not a
     user's /model pick, so it stays out of the shared-metrics switch count."""
+    if isinstance(session, dict) and session.get("agent") is None and not _prebuild_locked:
+        ready = None
+        with session.setdefault("agent_build_lock", threading.Lock()):
+            if session.get("agent") is None and session.get("agent_build_started"):
+                ready = session.get("agent_ready")
+            else:
+                # No worker has snapshotted the deferred arguments. Keep the lock
+                # through the user selection so the eventual build sees one atomic
+                # model/binding transaction.
+                return _apply_model_switch(
+                    sid,
+                    session,
+                    raw_input,
+                    confirm_expensive_model=confirm_expensive_model,
+                    pin_session_override=pin_session_override,
+                    parsed_flags=parsed_flags,
+                    persist_override=persist_override,
+                    count_switch=count_switch,
+                    _prebuild_locked=True,
+                )
+        # The worker already owns its build snapshot. Apply the user's choice to
+        # the attached agent instead of persisting a contradictory prebuild row.
+        if ready is None or not ready.wait(timeout=30.0):
+            raise ValueError("agent initialization did not finish before model selection")
+        if session.get("agent") is None:
+            raise ValueError(session.get("agent_error") or "agent initialization failed")
+        return _apply_model_switch(
+            sid,
+            session,
+            raw_input,
+            confirm_expensive_model=confirm_expensive_model,
+            pin_session_override=pin_session_override,
+            parsed_flags=parsed_flags,
+            persist_override=persist_override,
+            count_switch=count_switch,
+        )
+
     from hermes_cli.model_switch import switch_model
     model_input, explicit_provider, one_turn, persist_global, reasoning_effort = _switch_request(
         raw_input, parsed_flags, persist_override)
@@ -322,6 +384,7 @@ def _apply_model_switch(
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
     restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
+    rollback_snapshot = _snapshot_agent_model_runtime(agent) if agent else None
     if agent:
         _merge_preflight_warning(result, agent, session, cfg, custom_provs)
     if not confirm_expensive_model:
@@ -337,24 +400,47 @@ def _apply_model_switch(
         profile_model, profile_provider = _config_model_target()
         session["composer_override_profile"] = {
             "model": profile_model, "provider": profile_provider}
+    route_owned_switch = bool(
+        agent is not None and pin_session_override and not one_turn and count_switch)
+    candidate_override = {
+        "model": result.new_model, "provider": result.target_provider,
+        "base_url": result.base_url, "api_key": result.api_key, "api_mode": result.api_mode,
+    }
     try:
         if agent:
             # Provenance must exist before this transaction persists the switched runtime.
-            _commit_agent_switch(sid, session, agent, result, current_model, restore_snapshot)
+            _commit_agent_switch(
+                sid, session, agent, result, current_model, restore_snapshot,
+                finalize=not route_owned_switch)
+        # PER-SESSION override so a rebuild of THIS session (/new, resume) re-derives the model.
+        # Deliberately NOT written to process-global env (HERMES_MODEL & co.): the desktop hosts
+        # every same-profile session in one process, so os.environ would leak the switch to all.
+        if pin_session_override and isinstance(session, dict) and not one_turn:
+            if count_switch:
+                _mark_turn_route_user_owned(
+                    session,
+                    model=result.new_model,
+                    provider=result.target_provider,
+                    model_override=candidate_override,
+                )
+            else:
+                session["model_override"] = candidate_override
+        if route_owned_switch:
+            # _mark_turn_route_user_owned persisted the runtime and binding in one row write.
+            _finalize_agent_switch(
+                sid, session, result, restore_snapshot, persist_runtime=False)
     except Exception:
+        if route_owned_switch and rollback_snapshot is not None:
+            try:
+                _restore_agent_model_runtime(agent, rollback_snapshot)
+            except Exception:
+                logger.exception("failed to roll back live model after route-binding persistence failure")
         if records_composer_override:
             if had_composer_profile:
                 session["composer_override_profile"] = previous_composer_profile
             else:
                 session.pop("composer_override_profile", None)
         raise
-    # PER-SESSION override so a rebuild of THIS session (/new, resume) re-derives the model.
-    # Deliberately NOT written to process-global env (HERMES_MODEL & co.): the desktop hosts
-    # every same-profile session in one process, so os.environ would leak the switch to all.
-    if pin_session_override and isinstance(session, dict) and not one_turn:
-        session["model_override"] = {
-            "model": result.new_model, "provider": result.target_provider,
-            "base_url": result.base_url, "api_key": result.api_key, "api_mode": result.api_mode}
     if persist_global:
         from hermes_cli.model_switch import persist_model_selection
         persist_model_selection(result)

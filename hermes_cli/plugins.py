@@ -279,6 +279,19 @@ class PluginContext:
             return value
         return _nested_plugin_value(entry.get("config"), segments, default)
 
+    def get_secret(self, name: str, default: Optional[str] = None) -> Optional[str]:
+        """Read one env-named secret from the active profile scope.
+
+        Plugins should use this boundary instead of importing Hermes credential
+        helpers or reading process-global environment variables. The caller's
+        current profile scope remains authoritative under multiplexing.
+        """
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("secret name must be a non-empty string")
+        from agent.secret_scope import get_secret
+
+        return get_secret(name.strip(), default)
+
     def set_config(self, key: str, value: Any) -> None:
         """Atomically write one value in this plugin's ``settings`` subtree."""
         save_plugin_setting(self.plugin_id, self._segments(key), value)

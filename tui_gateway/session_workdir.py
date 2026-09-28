@@ -362,6 +362,11 @@ def _workdir_row_model_config(session: dict) -> tuple[str, dict]:
             model_config[flag] = True
     if isinstance(composer_profile := session.get("composer_override_profile"), dict):
         model_config["composer_override_profile"] = composer_profile
+    if isinstance(binding := session.get("turn_route_binding"), dict):
+        model_config["turn_route_binding"] = binding
+        model_config.pop("turn_route_pending", None)
+    elif session.get("turn_route_pending"):
+        model_config["turn_route_pending"] = True
     return row_model, model_config
 
 

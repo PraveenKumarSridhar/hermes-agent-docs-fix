@@ -336,9 +336,18 @@ class GatewayTurnMixin(GatewayTurnRoutingMixin):
             if not isinstance(config, dict):
                 config = {}
             gateway_runtime = dict(config.get("gateway_runtime") or {})
-            if row.get("model") == model and all(gateway_runtime.get(k) == v for k, v in runtime.items()):
+            same_runtime = row.get("model") == model and all(
+                gateway_runtime.get(k) == v for k, v in runtime.items())
+            stale_desktop_binding = (
+                "turn_route_binding" in config or "turn_route_pending" in config)
+            if same_runtime and not stale_desktop_binding:
                 return
             config["gateway_runtime"] = runtime
+            # A later messaging-gateway runtime becomes the durable authority for
+            # this conversation. Do not leave an older Desktop selection binding
+            # attached to a different effective route.
+            config.pop("turn_route_binding", None)
+            config.pop("turn_route_pending", None)
             db.update_session_meta(session_id, json.dumps(config), model=model)
         except Exception:
             logger.debug("Failed to sync gateway session model metadata", exc_info=True)

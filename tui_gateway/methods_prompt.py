@@ -444,6 +444,16 @@ def _storage_error_data(failure, raw) -> dict:
     return {"code": failure.code, "cause": failure.cause, "details": storage_failure_details(raw)}
 
 
+def _release_rejected_submit_turn(session: dict) -> None:
+    """Undo turn admission when no worker will own the accepted prompt."""
+    with session["history_lock"]:
+        session["running"] = False
+        session["last_active"] = time.time()
+        session.pop("_hosted_room_task", None)
+        _clear_inflight_turn(session)
+        _release_active_session_slot(session)
+
+
 def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
     """Lazily persist the DB row now that the user sent a message (a branch becomes real
     here), then the message itself (#111868: a freeze during the first build must leave a
@@ -478,12 +488,7 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
                 data=_storage_error_data(failure, exc))
     # No turn thread will start, so neither resume nor the busy queue may see
     # this rejected prompt as live. Release the slot a turn would normally own.
-    with session["history_lock"]:
-        session["running"] = False
-        session["last_active"] = time.time()
-        session.pop("_hosted_room_task", None)
-        _clear_inflight_turn(session)
-        _release_active_session_slot(session)
+    _release_rejected_submit_turn(session)
     return error
 
 
@@ -662,6 +667,21 @@ def _(rid, params: dict) -> dict:
         rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind)
     if err is not None:
         return err
+    # A fresh Desktop/TUI session with turn-route middleware cannot build until the first substantive
+    # prompt exists. Freeze and persist that route before either the local or compute-host build path.
+    try:
+        _resolve_initial_turn_route(sid, session, text, internal=internal_hosted_submit)
+    except Exception as exc:
+        from hermes_state_user_copy import describe_storage_failure
+        logger.warning("prompt.submit: turn-route binding failed", exc_info=True)
+        failure = describe_storage_failure(exc)
+        _release_rejected_submit_turn(session)
+        return _err(
+            rid, 5071,
+            f"Session routing state could not be saved, so this message was not sent. Cause: {failure.gloss}. "
+            f"{failure.action} Then send your message again.",
+            data=_storage_error_data(failure, exc),
+        )
     if turn_isolation:
         if turn_author:
             logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",

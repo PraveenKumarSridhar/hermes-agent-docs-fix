@@ -126,7 +126,12 @@ def _set_model(rid, params, key, value, session):
         failed_agent_init = (
             failed_agent_init and session.get("agent") is None and session.get("agent_error") is not None
             and session.get("agent_ready") is failed_ready and failed_ready.is_set())
-        if session.get("agent") is None and not explicit_provider.strip() and not failed_agent_init:
+        if (
+            session.get("agent") is None
+            and not explicit_provider.strip()
+            and not failed_agent_init
+            and not session.get("turn_route_pending")
+        ):
             _start_agent_build(sid, session)
             if init_err := _cfgset_await_agent(session, rid):
                 return init_err
