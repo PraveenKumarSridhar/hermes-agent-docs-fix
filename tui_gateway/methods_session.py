@@ -412,6 +412,7 @@ def _create_session(rid, params: dict, *, copy_parent_history: bool = False) -> 
             "transport": current_transport() or _stdio_transport,
             "auth_user_id": _transport_auth_user_id(current_transport())}
         _register_session_cwd(_sessions[sid])
+    _arm_initial_turn_route(_sessions[sid])
     if session_model_override:
         # A composer pick rides in as this override and beats model.default for the whole session;
         # name both so agent.log alone explains which model a new chat runs, and why (#107410).
@@ -615,7 +616,12 @@ class _Resume:
         """``_deferred_session_record`` with this resume's common fields (lease claimed lazily on turn 1);
         ``overrides`` restores the stored model/provider/reasoning/tier so the deferred build matches eager."""
         if overrides is not None:
-            extra.update(model_override=overrides.get("model_override"), resume_runtime_overrides=overrides or None)
+            extra.update(
+                model_override=overrides.get("model_override"),
+                resume_runtime_overrides=overrides or None,
+                turn_route_binding=overrides.get("turn_route_binding"),
+                turn_route_pending=bool(overrides.get("turn_route_pending")),
+            )
             model_config = _parse_model_config((self.found or {}).get("model_config"), quiet=True)
             follows_profile = _row_follows_profile(self.found)
         else:
@@ -914,11 +920,15 @@ def _resume_eager(ctx: _Resume) -> dict:
             # Profile db so turns persist to the right state.db; stored runtime identity so switching chats does
             # not inherit another chat's global model.
             stored_runtime_overrides = _stored_session_runtime_overrides(ctx.found)
+            agent_runtime_overrides = {
+                key: value for key, value in stored_runtime_overrides.items()
+                if key not in {"turn_route_binding", "turn_route_pending"}
+            }
             agent = _make_agent_in_context(
                 sid, ctx.target, session_db=ctx.db, platform_override=source,
                 cwd_override=ctx.profile_resume_cwd or None,
                 context_cwd_is_launch_artifact=(source in _LAUNCH_CWD_NOT_A_WORKSPACE and not ctx.profile_resume_cwd),
-                auth_user_id=_transport_auth_user_id(current_transport()), **stored_runtime_overrides)
+                auth_user_id=_transport_auth_user_id(current_transport()), **agent_runtime_overrides)
         except Exception as e:
             return _err(ctx.rid, 5000, resume_failed_message(e))
     with _session_resume_lock:
@@ -941,6 +951,9 @@ def _resume_eager(ctx: _Resume) -> dict:
             if (session := _sessions.get(sid)) is not None:
                 if stored_runtime_overrides.get("model_override") is not None:
                     session["model_override"] = stored_runtime_overrides["model_override"]
+                if stored_runtime_overrides.get("turn_route_binding") is not None:
+                    session["turn_route_binding"] = stored_runtime_overrides["turn_route_binding"]
+                session["turn_route_pending"] = bool(stored_runtime_overrides.get("turn_route_pending"))
                 model_config = _parse_model_config(ctx.found.get("model_config"), quiet=True)
                 if _row_follows_profile(ctx.found):
                     session["follow_profile_config"] = True
@@ -988,6 +1001,11 @@ def _(rid, params: dict) -> dict:
             return _resume_reuse_live(ctx, *live)
         if ctx.lazy:
             return _resume_lazy(ctx)
+        # Only an explicit current marker can defer eager construction. Legacy rows without it stay
+        # unrecorded and never become newly eligible for first-message routing.
+        model_config = _parse_model_config(ctx.found.get("model_config"), quiet=True)
+        if ctx.eager_build and model_config.get("turn_route_pending") is True:
+            return _resume_cold(ctx)
         if ctx.eager_build:
             return _resume_eager(ctx)
         return _resume_deferred(ctx) if ctx.defer_history else _resume_cold(ctx)

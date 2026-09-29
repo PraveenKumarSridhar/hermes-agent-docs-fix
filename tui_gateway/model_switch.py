@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import threading
 
 from .method_ctx import HandlerRegistry, bind_module
 
@@ -264,8 +265,40 @@ def _expensive_model_confirm(result, current_base_url: str, current_api_key, age
     return {"value": result.new_model, "warning": msg, "confirm_required": True, "confirm_message": msg}
 
 
-def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: str, snapshot):
-    """Swap the live agent in place, then restart/persist/mark/announce; a failed swap aborts."""
+def _finalize_agent_switch(
+    sid: str,
+    session: dict,
+    result,
+    snapshot,
+    *,
+    persist_runtime: bool = True,
+) -> None:
+    """Run post-swap effects after any route-binding transaction has committed."""
+    # This marker controls whether the next turn restores the previous runtime,
+    # so commit it before best-effort notifications and persistence side effects.
+    if snapshot is not None:
+        session["one_turn_model_restore"] = snapshot
+    else:
+        session.pop("one_turn_model_restore", None)
+    _restart_slash_worker(sid, session)
+    if persist_runtime:
+        _persist_live_session_runtime(session)
+    _persist_live_session_system_prompt(session)
+    _append_model_switch_marker(session, model=result.new_model, provider=result.target_provider)
+    _emit_session_info(sid, session)
+
+
+def _commit_agent_switch(
+    sid: str,
+    session: dict,
+    agent,
+    result,
+    current_model: str,
+    snapshot,
+    *,
+    finalize: bool = True,
+):
+    """Swap the live agent, optionally deferring effects until route persistence commits."""
     try:
         agent.switch_model(
             new_model=result.new_model, new_provider=result.target_provider, api_key=result.api_key,
@@ -281,26 +314,63 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
         logger.warning("In-place model switch failed for TUI agent: %s", exc)
         raise ValueError(f"Model switch to {result.new_model} failed ({exc}); "
                          f"staying on {getattr(agent, 'model', current_model)}.") from exc
-    _restart_slash_worker(sid, session)
-    _persist_live_session_runtime(session)
-    _persist_live_session_system_prompt(session)
-    _append_model_switch_marker(session, model=result.new_model, provider=result.target_provider)
-    _emit_session_info(sid, session)
-    if snapshot is not None:
-        session["one_turn_model_restore"] = snapshot
-    else:
-        session.pop("one_turn_model_restore", None)
+    if finalize:
+        _finalize_agent_switch(sid, session, result, snapshot)
 
 
 def _apply_model_switch(
     sid: str, session: dict, raw_input: str, *, confirm_expensive_model: bool = False,
     pin_session_override: bool = True, parsed_flags: Any | None = None,
-    persist_override: bool | None = None, count_switch: bool = True) -> dict:
+    persist_override: bool | None = None, count_switch: bool = True,
+    _prebuild_locked: bool = False) -> dict:
     """``count_switch=False``: an internal swap (config adoption, MoA one-shot and its restore), not a
     user's /model pick, so it stays out of the shared-metrics switch count."""
+    if isinstance(session, dict) and session.get("agent") is None and not _prebuild_locked:
+        ready = None
+        with session.setdefault("agent_build_lock", threading.Lock()):
+            if session.get("agent") is None and session.get("agent_build_started"):
+                ready = session.get("agent_ready")
+            else:
+                # No worker has snapshotted the deferred arguments. Keep the lock
+                # through the user selection so the eventual build sees one atomic
+                # model/binding transaction.
+                return _apply_model_switch(
+                    sid,
+                    session,
+                    raw_input,
+                    confirm_expensive_model=confirm_expensive_model,
+                    pin_session_override=pin_session_override,
+                    parsed_flags=parsed_flags,
+                    persist_override=persist_override,
+                    count_switch=count_switch,
+                    _prebuild_locked=True,
+                )
+        # The worker already owns its build snapshot. Apply the user's choice to
+        # the attached agent instead of persisting a contradictory prebuild row.
+        if ready is None or not ready.wait(timeout=30.0):
+            raise ValueError("agent initialization did not finish before model selection")
+        if session.get("agent") is None:
+            raise ValueError(session.get("agent_error") or "agent initialization failed")
+        return _apply_model_switch(
+            sid,
+            session,
+            raw_input,
+            confirm_expensive_model=confirm_expensive_model,
+            pin_session_override=pin_session_override,
+            parsed_flags=parsed_flags,
+            persist_override=persist_override,
+            count_switch=count_switch,
+        )
+
     from hermes_cli.model_switch import switch_model
     model_input, explicit_provider, one_turn, persist_global, reasoning_effort = _switch_request(
         raw_input, parsed_flags, persist_override)
+    selected_reasoning = None
+    if reasoning_effort:
+        from hermes_constants import parse_reasoning_effort
+        selected_reasoning = parse_reasoning_effort(reasoning_effort)
+        if selected_reasoning is None:
+            raise ValueError(f"unknown reasoning value: {reasoning_effort}")
     agent = session.get("agent")
     if one_turn and not agent:
         raise ValueError("/model --once requires a live session")
@@ -322,12 +392,51 @@ def _apply_model_switch(
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
     restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
+    rollback_snapshot = _snapshot_agent_model_runtime(agent) if agent else None
     if agent:
         _merge_preflight_warning(result, agent, session, cfg, custom_provs)
     if not confirm_expensive_model:
         confirm = _expensive_model_confirm(result, current_base_url, current_api_key, agent)
         if confirm is not None:
             return confirm
+    global_config_snapshot = None
+    next_config = None
+    rollback_paths: tuple[tuple[str, ...], ...] = ()
+    if persist_global:
+        from hermes_cli.model_switch import apply_model_selection
+
+        with _cfg_lock:
+            global_config_snapshot = _load_cfg_raw()
+            next_config = copy.deepcopy(global_config_snapshot)
+            next_config["model"] = apply_model_selection(next_config.get("model"), result)
+            model_before = (
+                global_config_snapshot.get("model")
+                if isinstance(global_config_snapshot.get("model"), dict)
+                else {}
+            )
+            model_after = next_config["model"]
+            changed_model_keys = {
+                key for key in set(model_before) | set(model_after)
+                if model_before.get(key, _CFG_FIELD_MISSING) != model_after.get(key, _CFG_FIELD_MISSING)
+            }
+            rollback_paths = tuple(("model", key) for key in sorted(changed_model_keys))
+            if selected_reasoning is not None:
+                agent_config = next_config.get("agent")
+                agent_config = dict(agent_config) if isinstance(agent_config, dict) else {}
+                agent_config["reasoning_effort"] = reasoning_effort
+                next_config["agent"] = agent_config
+                rollback_paths += (("agent", "reasoning_effort"),)
+            try:
+                _save_cfg(next_config)
+            except Exception as exc:
+                try:
+                    _conditional_restore_config_fields(
+                        global_config_snapshot, next_config, rollback_paths)
+                except Exception as rollback_exc:
+                    raise RuntimeError(
+                        f"model config update failed and rollback failed: {rollback_exc}"
+                    ) from exc
+                raise
     records_composer_override = (
         pin_session_override and isinstance(session, dict) and not one_turn
         and not persist_global and session.get("follow_profile_config"))
@@ -337,28 +446,86 @@ def _apply_model_switch(
         profile_model, profile_provider = _config_model_target()
         session["composer_override_profile"] = {
             "model": profile_model, "provider": profile_provider}
+    route_owned_switch = bool(
+        agent is not None and pin_session_override and not one_turn and count_switch)
+    candidate_override = {
+        "model": result.new_model, "provider": result.target_provider,
+        "base_url": result.base_url, "api_key": result.api_key, "api_mode": result.api_mode,
+    }
     try:
         if agent:
             # Provenance must exist before this transaction persists the switched runtime.
-            _commit_agent_switch(sid, session, agent, result, current_model, restore_snapshot)
-    except Exception:
+            _commit_agent_switch(
+                sid, session, agent, result, current_model, restore_snapshot,
+                finalize=False)
+        # PER-SESSION override so a rebuild of THIS session (/new, resume) re-derives the model.
+        # Deliberately NOT written to process-global env (HERMES_MODEL & co.): the desktop hosts
+        # every same-profile session in one process, so os.environ would leak the switch to all.
+        if pin_session_override and isinstance(session, dict) and not one_turn:
+            if count_switch:
+                _mark_turn_route_user_owned(
+                    session,
+                    model=result.new_model,
+                    provider=result.target_provider,
+                    model_override=candidate_override,
+                    reasoning_config=selected_reasoning,
+                    resolved_runtime={
+                        "provider": result.target_provider,
+                        "requested_provider": result.target_provider,
+                        "base_url": result.base_url,
+                        "api_mode": result.api_mode,
+                    },
+                )
+            else:
+                session["model_override"] = candidate_override
+    except Exception as exc:
+        if route_owned_switch and rollback_snapshot is not None:
+            try:
+                _restore_agent_model_runtime(agent, rollback_snapshot)
+            except Exception:
+                logger.exception("failed to roll back live model after route-binding persistence failure")
+                # The durable binding still describes the old runtime. Do not leave a
+                # mismatched live agent reachable after the compensating action fails.
+                session["agent"] = None
+                session["agent_error"] = (
+                    "model runtime rollback failed; rebuild the session agent from its durable binding"
+                )
+                session["turn_route_runtime_error"] = True
+                with contextlib.suppress(Exception):
+                    agent.close()
         if records_composer_override:
             if had_composer_profile:
                 session["composer_override_profile"] = previous_composer_profile
             else:
                 session.pop("composer_override_profile", None)
+        if global_config_snapshot is not None and next_config is not None:
+            try:
+                _conditional_restore_config_fields(
+                    global_config_snapshot, next_config, rollback_paths)
+            except Exception as rollback_exc:
+                raise RuntimeError(
+                    f"model switch failed and config rollback failed: {rollback_exc}"
+                ) from exc
         raise
-    # PER-SESSION override so a rebuild of THIS session (/new, resume) re-derives the model.
-    # Deliberately NOT written to process-global env (HERMES_MODEL & co.): the desktop hosts
-    # every same-profile session in one process, so os.environ would leak the switch to all.
-    if pin_session_override and isinstance(session, dict) and not one_turn:
-        session["model_override"] = {
-            "model": result.new_model, "provider": result.target_provider,
-            "base_url": result.base_url, "api_key": result.api_key, "api_mode": result.api_mode}
-    if persist_global:
-        from hermes_cli.model_switch import persist_model_selection
-        persist_model_selection(result)
-    if reasoning_effort:
+    if agent is not None:
+        try:
+            _finalize_agent_switch(
+                sid,
+                session,
+                result,
+                restore_snapshot,
+                persist_runtime=not route_owned_switch,
+            )
+        except Exception:
+            logger.exception("post-commit model switch finalization failed")
+    reasoning_committed = bool(
+        selected_reasoning is not None and pin_session_override and not one_turn and count_switch)
+    if reasoning_committed:
+        try:
+            _emit_session_info(sid, session)
+        except Exception:
+            logger.debug("failed to emit session info after model switch commit", exc_info=True)
+    elif reasoning_effort:
         _apply_switch_reasoning(sid, session, agent, reasoning_effort, persist_global=persist_global, one_turn=one_turn)
     if count_switch:
         from hermes_cli.observability.shared_metrics_events import record_model_switch
@@ -388,9 +555,7 @@ def _apply_switch_reasoning(sid: str, session, agent, effort: str, *, persist_gl
         return
     if persist_global:
         _write_config_key("agent.reasoning_effort", effort)
-        session.pop("create_reasoning_override", None)  # global wins; see _set_reasoning
-    else:
-        session["create_reasoning_override"] = parsed
+    session["create_reasoning_override"] = parsed
     if agent is not None:
         _persist_live_session_runtime(session)
         _emit_session_info(sid, session)  # the switch's own emit predates the effort change

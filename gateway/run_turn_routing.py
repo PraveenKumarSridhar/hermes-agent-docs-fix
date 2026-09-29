@@ -46,75 +46,32 @@ class GatewayTurnRoutingMixin:
         from gateway.run import _deep_merge_request_overrides
         from hermes_cli.models import resolve_fast_mode_overrides
 
-        runtime, base_request_overrides = _project_runtime_agent_kwargs(runtime_kwargs)
+        from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+        from hermes_cli.turn_routing import resolve_turn_route
+
+        selected = resolve_turn_route(
+            model,
+            runtime_kwargs,
+            resolve_runtime=lambda provider, target_model: _resolve_runtime_agent_kwargs_for_provider(
+                provider, target_model=target_model),
+            user_message=user_message,
+            session_id=session_id,
+            session_key=session_key,
+            source=source.platform.value if source and source.platform else "gateway",
+            is_first_turn=not bool(conversation_history),
+            internal=internal,
+        )
+        runtime, base_request_overrides = _project_runtime_agent_kwargs(selected["runtime"])
         route = {
-            "model": model,
+            "model": selected["model"],
             "runtime": runtime,
             "signature": (
-                model, runtime["provider"], runtime["requested_provider"], runtime["base_url"],
+                selected["model"], runtime["provider"], runtime["requested_provider"], runtime["base_url"],
                 runtime["api_mode"], runtime["command"], tuple(runtime["args"]),
             ),
         }
-        if not internal:
-            try:
-                from hermes_cli.middleware import apply_turn_route_middleware, public_turn_route
-
-                result = apply_turn_route_middleware(
-                    public_turn_route(route["model"], runtime),
-                    user_message=user_message,
-                    session_id=session_id,
-                    session_key=session_key,
-                    source=source.platform.value if source and source.platform else "gateway",
-                    is_user_turn=True,
-                    is_first_turn=not bool(conversation_history),
-                    internal=False,
-                    tool_continuation=False,
-                )
-                if result.changed and isinstance(result.payload, dict):
-                    selected_model = result.payload.get("model")
-                    public_runtime = result.payload.get("runtime")
-                    public_runtime = public_runtime if isinstance(public_runtime, dict) else {}
-                    current_requested = runtime.get("requested_provider") or runtime.get("provider")
-                    current_canonical = runtime.get("provider")
-                    top_requested = result.payload.get("requested_provider")
-                    nested_requested = public_runtime.get("requested_provider")
-                    requested = (
-                        nested_requested
-                        if nested_requested and nested_requested != current_requested
-                        else (top_requested or nested_requested)
-                    )
-                    canonical = result.payload.get("provider") or public_runtime.get("provider")
-                    selected_provider = (
-                        requested
-                        if requested and requested != current_requested
-                        else (
-                            canonical
-                            if canonical and canonical != current_canonical
-                            else (requested or canonical or current_requested)
-                        )
-                    )
-                    if (
-                        isinstance(selected_model, str)
-                        and selected_model.strip()
-                        and isinstance(selected_provider, str)
-                        and selected_provider.strip()
-                    ):
-                        selected_model = selected_model.strip()
-                        selected_provider = selected_provider.strip()
-                        if selected_provider != current_requested or selected_model != model:
-                            from gateway.run import _resolve_runtime_agent_kwargs_for_provider
-
-                            runtime, base_request_overrides = _project_runtime_agent_kwargs(
-                                _resolve_runtime_agent_kwargs_for_provider(
-                                    selected_provider, target_model=selected_model
-                                )
-                            )
-                        runtime["requested_provider"] = selected_provider
-                        route["model"] = selected_model
-                        route["runtime"] = runtime
-                        route["middleware_trace"] = result.trace
-            except Exception as exc:
-                logger.warning("Turn-route middleware failed open: %s", exc)
+        if selected.get("middleware_trace"):
+            route["middleware_trace"] = selected["middleware_trace"]
         if getattr(self, "_service_tier", None) != "priority":
             route["request_overrides"] = base_request_overrides
             return route

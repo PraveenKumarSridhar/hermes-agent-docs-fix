@@ -23,12 +23,17 @@ LLM_EXECUTION_MIDDLEWARE = "llm_execution"
 # Turn-route middleware runs once before Hermes constructs a provider client or
 # agent; it is separate from request middleware for an already selected route.
 TURN_ROUTE_MIDDLEWARE = "turn_route"
+TURN_ROUTE_API_VERSION = 1
 PUBLIC_TURN_RUNTIME_KEYS = ("provider", "requested_provider", "api_mode")
 
 
-def public_turn_route(model: str, runtime: Dict[str, Any]) -> Dict[str, Any]:
+def public_turn_route(
+    model: str,
+    runtime: Dict[str, Any],
+    reasoning_config: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     """Build the redacted route DTO exposed to turn-route middleware."""
-    return {
+    route = {
         "model": model,
         "provider": runtime.get("provider"),
         "requested_provider": runtime.get("requested_provider"),
@@ -38,6 +43,15 @@ def public_turn_route(model: str, runtime: Dict[str, Any]) -> Dict[str, Any]:
             if runtime.get(key) not in (None, "")
         },
     }
+    if isinstance(reasoning_config, dict):
+        effort = (
+            "none"
+            if reasoning_config.get("enabled") is False
+            else str(reasoning_config.get("effort") or "").strip().lower()
+        )
+        if effort:
+            route["current_reasoning_effort"] = effort
+    return route
 
 VALID_MIDDLEWARE: set[str] = {
     TOOL_REQUEST_MIDDLEWARE, TOOL_EXECUTION_MIDDLEWARE, LLM_REQUEST_MIDDLEWARE, LLM_EXECUTION_MIDDLEWARE,
@@ -95,7 +109,7 @@ def _apply_request_chain(
         current = _safe_copy(next_payload)
         entry = {
             key: value
-            for key in ("plugin", "source", "reason", "name")
+            for key in ("plugin", "source", "reason", "name", "status")
             if isinstance(value := result.get(key), str) and value
         }
         trace.append(entry or {"source": "plugin"})
@@ -140,7 +154,7 @@ def apply_turn_route_middleware(route: Dict[str, Any], **context: Any) -> Reques
         current_route = _safe_copy(result["route"])
         entry = {
             key: value
-            for key in ("plugin", "source", "reason", "name")
+            for key in ("plugin", "source", "reason", "name", "status")
             if isinstance(value := result.get(key), str) and value
         }
         trace.append(entry or {"source": "plugin"})

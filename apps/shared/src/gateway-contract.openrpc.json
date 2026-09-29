@@ -3535,6 +3535,24 @@
       }
     },
     {
+      "name": "session.turn_route.read",
+      "summary": "Read one live session's persisted route binding without activating storage or constructing an agent.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SessionTurnRouteReadParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionTurnRouteReadResult"
+        }
+      }
+    },
+    {
       "name": "session.undo",
       "summary": "Drop the last user turn (and everything after it) from an idle session.",
       "params": [
@@ -31487,6 +31505,145 @@
           "title"
         ],
         "title": "SessionTitleResult",
+        "type": "object"
+      },
+      "SessionTurnRouteReadParams": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "stored_session_id": {
+            "title": "Stored Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "stored_session_id"
+        ],
+        "title": "SessionTurnRouteReadParams",
+        "type": "object"
+      },
+      "SessionTurnRouteReadResult": {
+        "additionalProperties": false,
+        "properties": {
+          "schema_version": {
+            "const": "hermes.turn_route.binding.v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "stored_session_id": {
+            "title": "Stored Session Id",
+            "type": "string"
+          },
+          "evidence": {
+            "const": "session_binding",
+            "title": "Evidence",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "unrecorded",
+              "unavailable",
+              "default",
+              "routed",
+              "user"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "owner": {
+            "enum": [
+              "default",
+              "middleware",
+              "user"
+            ],
+            "title": "Owner",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "requested_provider": {
+            "title": "Requested Provider",
+            "type": "string"
+          },
+          "middleware_plugins": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Middleware Plugins",
+            "type": "array"
+          },
+          "middleware_reason": {
+            "title": "Middleware Reason",
+            "type": "string"
+          },
+          "reasoning_effort": {
+            "enum": [
+              "",
+              "none",
+              "minimal",
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max",
+              "ultra"
+            ],
+            "title": "Reasoning Effort",
+            "type": "string"
+          },
+          "reasoning_owner": {
+            "enum": [
+              "default",
+              "middleware",
+              "user"
+            ],
+            "title": "Reasoning Owner",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "session_id",
+          "stored_session_id",
+          "evidence",
+          "status",
+          "owner",
+          "model",
+          "provider",
+          "requested_provider",
+          "middleware_plugins",
+          "middleware_reason",
+          "reasoning_effort",
+          "reasoning_owner"
+        ],
+        "title": "SessionTurnRouteReadResult",
         "type": "object"
       },
       "SessionUndoParams": {

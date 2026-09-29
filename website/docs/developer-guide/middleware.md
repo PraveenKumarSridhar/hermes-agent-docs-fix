@@ -54,7 +54,7 @@ Supported middleware kinds:
 | `tool_request` | `tool_name`, `args`, `original_args` | `{"args": {...}}` | Replace effective tool args before hooks, guardrails, approvals, and execution. |
 | `llm_execution` | `request`, `original_request`, `next_call` | Any provider response | Wrap or replace the actual provider call. |
 | `tool_execution` | `tool_name`, `args`, `original_args`, `next_call` | Any tool result | Wrap or replace the actual tool call. |
-| `turn_route` | `route`, `original_redacted_route`, `user_message`, `session_id`, `session_key` | `{"route": {...}}` | Select public model/provider metadata before agent construction. |
+| `turn_route` | `route`, `original_redacted_route`, `user_message`, `session_id`, `session_key` | `{"route": {...}}` | Select public model, provider, and reasoning metadata before agent construction. |
 
 `original_redacted_route` is the host route after public redaction; it never
 contains credentials, ACP command arguments, or other private runtime fields.
@@ -66,10 +66,47 @@ vectors are never exposed. `requested_provider` is the selector passed through
 Hermes' normal resolver, while `provider` and `api_mode` remain host-derived
 diagnostic fields. Middleware may replace `model` and `requested_provider`, but
 must not use the informational runtime fields to select credentials or a
-transport. Hermes resolves or refreshes credentials for the selected provider
-through its normal resolver after this decision. Internal events and tool
+transport. When `current_reasoning_effort` is present, middleware may add a
+`reasoning_effort` selection, or set `preserve_reasoning: true` to retain the
+current host policy across a model change. Hermes validates a selected effort
+against the selected provider/model route. A user's explicit reasoning
+selection takes precedence.
+Hermes resolves or refreshes credentials for the selected provider through its
+normal resolver after this decision. The versioned contract is declared as
+`TURN_ROUTE_API_VERSION = 1`. Internal events and tool
 continuations must set `internal` or `tool_continuation` and bypass this phase.
 Routing failures are fail-open and retain the host route.
+
+Policy middleware that needs its own classifier token can call
+`ctx.get_secret("MY_PLUGIN_API_KEY")`. This reads the active profile's secret
+scope and avoids process-global environment leakage in multiplexed hosts.
+
+### Desktop and TUI session binding
+
+Desktop and TUI keep one agent for the life of a conversation. For a fresh
+session with active `turn_route` middleware, Hermes defers agent construction
+until the first external prompt, resolves the public model, provider, and reasoning effort, then
+stores a host-owned `turn_route_binding` with the session. Later prompts and
+cold resumes reuse that binding without rerunning the middleware. A model or
+provider chosen explicitly by the user takes precedence and records user
+ownership instead.
+
+Clients and plugins can read the live binding with
+`session.turn_route.read`. The request must include both the runtime
+`session_id` and durable `stored_session_id`. This read does not open storage,
+activate a profile, wait for a build, or construct an agent. Its result is an
+allowlisted view with `evidence: "session_binding"`; it proves the selected and
+persisted session route only. It does not prove that a provider request ran,
+which model served the request, or whether a retry or fallback occurred.
+
+The persisted binding contains public model and provider identities, a bounded
+reasoning effort, model and reasoning ownership, bounded middleware manifest
+names, and an optional 64-character machine-readable reason code. Reason codes
+are restricted to ASCII letters, digits, `_`, `.`, `:`, `/`, and `-`. Hermes
+does not persist middleware prose, arbitrary callback metadata, credentials,
+base URLs, ACP arguments, or fallback state in this field. Legacy sessions
+without a binding report `unrecorded` and are never inferred to be eligible for
+rerouting.
 
 Request middleware can return optional trace fields:
 

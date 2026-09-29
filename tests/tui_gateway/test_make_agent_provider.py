@@ -97,9 +97,14 @@ def test_apply_model_switch_does_not_leak_process_env():
     assert sess_b["model_override"]["model"] == "zai/glm-5.1"
     assert sess_b["model_override"]["provider"] == "zai"
     assert sess_b["composer_override_profile"] == {"model": "minimax/m3", "provider": "minimax"}
-    # _commit_agent_switch owns the runtime transaction; provenance must be present
-    # on its first (and only) DB write rather than relying on a second best-effort write.
-    persist_runtime.assert_called_once_with(sess_b)
+    # The detached transaction carries provenance and user route ownership on its
+    # first (and only) DB write, before live session state is acknowledged.
+    persist_runtime.assert_called_once()
+    persisted = persist_runtime.call_args.args[0]
+    assert persisted["composer_override_profile"] == {
+        "model": "minimax/m3", "provider": "minimax"}
+    assert persisted["turn_route_binding"]["owner"] == "user"
+    assert persisted["model_override"]["model"] == "zai/glm-5.1"
     assert persisted_composer_profiles == [{"model": "minimax/m3", "provider": "minimax"}]
     # The switched agent mutated in place.
     assert sess_b["agent"].model == "zai/glm-5.1"

@@ -4308,6 +4308,26 @@ export interface OnboardingCatalogPlugin {
   app_state: CatalogAppState
   sentence: string
 }
+export interface SessionTurnRouteReadParams {
+  session_id: string
+  profile?: string | null
+  stored_session_id: string
+}
+export interface SessionTurnRouteReadResult {
+  schema_version: 'hermes.turn_route.binding.v1'
+  session_id: string
+  stored_session_id: string
+  evidence: 'session_binding'
+  status: 'pending' | 'unrecorded' | 'unavailable' | 'default' | 'routed' | 'user'
+  owner: 'default' | 'middleware' | 'user'
+  model: string
+  provider: string
+  requested_provider: string
+  middleware_plugins: string[]
+  middleware_reason: string
+  reasoning_effort: '' | 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'
+  reasoning_owner: 'default' | 'middleware' | 'user'
+}
 /** Single question: ``question`` / ``choices`` (/ ``multi_select``); batch: ``questions``. ``answers`` rides only on a reconnect replay (locks the server already accepted). */
 export interface ClarifyRequestParams {
   session_id: string
@@ -5242,6 +5262,8 @@ export interface RpcMethods {
   'session.steer': { params: SessionCorrectionParams; result: SessionCorrectionResult }
   /** Read or set a live session's title; a title set before the row exists is queued. */
   'session.title': { params: SessionTitleParams; result: SessionTitleResult }
+  /** Read one live session's persisted route binding without activating storage or constructing an agent. */
+  'session.turn_route.read': { params: SessionTurnRouteReadParams; result: SessionTurnRouteReadResult }
   /** Drop the last user turn (and everything after it) from an idle session. */
   'session.undo': { params: SessionUndoParams; result: SessionUndoResult }
   /** Token / context / cost counters for the session (+ Nous credit lines when available). */
@@ -5551,6 +5573,7 @@ export const RPC_METHODS = [
   'session.status',
   'session.steer',
   'session.title',
+  'session.turn_route.read',
   'session.undo',
   'session.usage',
   'session.workspace.move',

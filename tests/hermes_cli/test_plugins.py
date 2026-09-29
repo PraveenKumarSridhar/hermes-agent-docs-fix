@@ -46,6 +46,21 @@ def test_portable_skill_namespace_is_ascii_safe():
     assert is_valid_namespace(namespace)
 
 
+def test_plugin_context_reads_secret_through_active_profile_scope(monkeypatch):
+    manager = PluginManager()
+    context = PluginContext(PluginManifest(name="secret-reader", source="user"), manager)
+    calls = []
+    monkeypatch.setattr(
+        "agent.secret_scope.get_secret",
+        lambda name, default=None: calls.append((name, default)) or "scoped-secret",
+    )
+
+    assert context.get_secret("PLUGIN_API_KEY") == "scoped-secret"
+    assert calls == [("PLUGIN_API_KEY", None)]
+    with pytest.raises(ValueError, match="non-empty"):
+        context.get_secret("  ")
+
+
 @pytest.mark.parametrize("parameter_name", ["session_id", "session_key", "platform"])
 def test_legacy_plugin_command_parameter_names_keep_raw_args(parameter_name):
     calls = []
@@ -447,10 +462,12 @@ class TestPluginDiscovery:
                 "command": "hermes-acp",
                 "args": ["--api-key", "acp-token-value"],
             },
+            {"enabled": True, "effort": "medium"},
         )
         result = apply_turn_route_middleware(route, session_id="physical", session_key="durable")
 
         assert result.payload["marker"] == "redacted"
+        assert result.payload["current_reasoning_effort"] == "medium"
         assert result.trace == [{"plugin": "router_plugin", "source": "router"}]
         assert "provider-token-value" not in repr(result.original_payload)
         assert "acp-token-value" not in repr(result.original_payload)
