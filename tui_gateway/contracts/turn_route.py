@@ -19,7 +19,7 @@ class SessionTurnRouteReadResult(Result):
     session_id: str
     stored_session_id: str
     evidence: Literal["session_binding"]
-    status: Literal["pending", "unrecorded", "default", "routed", "user"]
+    status: Literal["pending", "unrecorded", "unavailable", "default", "routed", "user"]
     owner: Literal["default", "middleware", "user"]
     model: str
     provider: str

@@ -31563,6 +31563,7 @@
             "enum": [
               "pending",
               "unrecorded",
+              "unavailable",
               "default",
               "routed",
               "user"

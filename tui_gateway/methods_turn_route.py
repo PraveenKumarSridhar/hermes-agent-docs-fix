@@ -336,6 +336,7 @@ def _mark_turn_route_user_owned(
     provider: str | None,
     model_override: dict | None = None,
     reasoning_config: dict | None = None,
+    resolved_runtime: dict | None = None,
 ) -> None:
     """Commit a persistent user model choice without changing one-turn/internal ownership."""
     if not isinstance(session, dict):
@@ -349,6 +350,15 @@ def _mark_turn_route_user_owned(
             "base_url": str(getattr(agent, "base_url", None) or ""),
             "api_mode": str(getattr(agent, "api_mode", None) or ""),
         }
+    elif isinstance(resolved_runtime, dict):
+        selected_model = str(model or "")
+        runtime = {
+            "provider": str(resolved_runtime.get("provider") or provider or ""),
+            "requested_provider": str(
+                resolved_runtime.get("requested_provider") or provider or ""),
+            "base_url": str(resolved_runtime.get("base_url") or ""),
+            "api_mode": str(resolved_runtime.get("api_mode") or ""),
+        }
     else:
         try:
             with _session_profile_runtime_scope(session):
@@ -357,25 +367,36 @@ def _mark_turn_route_user_owned(
             selected_model = str(model or "")
             runtime = {"provider": str(provider or ""), "requested_provider": str(provider or "")}
     explicit_reasoning = isinstance(reasoning_config, dict)
-    reasoning = reasoning_config if explicit_reasoning else (
-        getattr(agent, "reasoning_config", None) if agent is not None else session.get(
-            "create_reasoning_override")
+    resumed_reasoning = session.get("resume_runtime_overrides")
+    resumed_reasoning = (
+        resumed_reasoning.get("reasoning_config_override")
+        if isinstance(resumed_reasoning, dict) else None
     )
+    existing_reasoning = (
+        getattr(agent, "reasoning_config", None)
+        if agent is not None else session.get("create_reasoning_override") or resumed_reasoning
+    )
+    reasoning = reasoning_config if explicit_reasoning else existing_reasoning
     if not isinstance(reasoning, dict):
         reasoning = _load_reasoning_config(selected_model)
+    reasoning_pinned = (
+        explicit_reasoning
+        or session.get("create_reasoning_override") is not None
+        or isinstance(resumed_reasoning, dict)
+    )
     binding = _binding(
         "user", "user", selected_model, runtime,
         reasoning_config=reasoning,
         reasoning_owner=(
             "user"
-            if explicit_reasoning or session.get("create_reasoning_override") is not None
+            if reasoning_pinned
             else "default"
         ),
     )
     persisted = dict(session)
     if model_override is not None:
         persisted["model_override"] = model_override
-    if explicit_reasoning:
+    if reasoning_pinned:
         # Keep this conversation pinned to the selected effort until /new clears
         # the override. Otherwise a later global config edit can change an
         # agentless session between selection and construction.
@@ -392,7 +413,7 @@ def _mark_turn_route_user_owned(
         raise RuntimeError("user turn-route binding could not be persisted")
     if model_override is not None:
         session["model_override"] = model_override
-    if explicit_reasoning:
+    if reasoning_pinned:
         session["create_reasoning_override"] = reasoning
     session["turn_route_binding"] = binding
     session["turn_route_pending"] = False
@@ -448,6 +469,19 @@ def _mark_turn_route_reasoning_owned(
 
 
 def _read_binding(session: dict) -> dict:
+    if session.get("turn_route_runtime_error"):
+        return {
+            "schema_version": TURN_ROUTE_BINDING_SCHEMA_VERSION,
+            "status": "unavailable",
+            "owner": "default",
+            "model": "",
+            "provider": "",
+            "requested_provider": "",
+            "middleware_plugins": [],
+            "middleware_reason": "",
+            "reasoning_effort": "",
+            "reasoning_owner": "default",
+        }
     if safe := _safe_binding(session.get("turn_route_binding")):
         return safe
     if session.get("turn_route_pending"):

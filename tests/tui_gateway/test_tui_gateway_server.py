@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -9851,7 +9852,7 @@ def test_config_set_model_global_persists(monkeypatch):
         warning_message="",
     )
     seen = {}
-    saved_values = {}
+    saved_configs = []
 
     def _switch_model(**kwargs):
         seen.update(kwargs)
@@ -9861,9 +9862,10 @@ def test_config_set_model_global_persists(monkeypatch):
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", _switch_model)
     monkeypatch.setattr(server, "_restart_slash_worker", lambda sid, session: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
-    # persist_model_selection uses targeted per-key writes (#48305) so it
-    # preserves sibling model.* keys instead of rewriting the whole block.
-    monkeypatch.setattr("utils.atomic_roundtrip_yaml_update", lambda path, key, value: saved_values.__setitem__(key, value))
+    monkeypatch.setattr(server, "_load_cfg_raw", lambda: {
+        "model": {"default": "old/model", "provider": "openrouter", "keep": "sibling"},
+    })
+    monkeypatch.setattr(server, "_save_cfg", lambda value: saved_configs.append(copy.deepcopy(value)))
 
     resp = server.handle_request(
         {
@@ -9879,9 +9881,13 @@ def test_config_set_model_global_persists(monkeypatch):
 
     assert resp["result"]["value"] == "anthropic/claude-sonnet-4.6"
     assert seen["is_global"] is True
-    assert saved_values["model.default"] == "anthropic/claude-sonnet-4.6"
-    assert saved_values["model.provider"] == "anthropic"
-    assert saved_values["model.base_url"] == "https://api.anthropic.com"
+    assert saved_configs == [{"model": {
+        "default": "anthropic/claude-sonnet-4.6",
+        "provider": "anthropic",
+        "base_url": "https://api.anthropic.com",
+        "api_mode": "anthropic_messages",
+        "keep": "sibling",
+    }}]
 
 
 def test_config_set_model_explicit_provider_skips_broken_default_init(monkeypatch):
@@ -10177,19 +10183,20 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
         assert session["agent"].model == "new/model"
         assert session["agent"].base_url == profile_url
         assert session["agent"].api_key == "profile-secret"
-        assert seen["persisted"] == [
-            {
-                "key": "session-key",
+        # The prebuild transaction persists the user binding before construction;
+        # the successful rebuilt agent then reconciles the live runtime.
+        assert len(seen["persisted"]) == 2
+        for persisted in seen["persisted"]:
+            assert persisted["key"] == "session-key"
+            assert persisted["model"] == "new/model"
+            assert persisted["config"] == {
+                "turn_route_binding": session["turn_route_binding"],
                 "model": "new/model",
-                "config": {
-                    "model": "new/model",
-                    "provider": "custom:new-provider",
-                    "base_url": profile_url,
-                    "api_mode": "chat_completions",
-                    "reasoning_config": reasoning,
-                },
+                "provider": "custom:new-provider",
+                "base_url": profile_url,
+                "api_mode": "chat_completions",
+                "reasoning_config": reasoning,
             }
-        ]
     finally:
         release_old_finally.set()
         old_ready.set()

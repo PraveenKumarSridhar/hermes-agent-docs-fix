@@ -152,6 +152,39 @@ def test_global_session_failure_rolls_back_config_and_live_runtime(_quiet_switch
     assert "model_override" not in session
 
 
+def test_binding_and_runtime_rollback_failure_quarantines_agent(_quiet_switch, monkeypatch):
+    agent = _Agent()
+    old_binding = {
+        "schema_version": "hermes.turn_route.binding.v1",
+        "status": "routed",
+        "owner": "middleware",
+        "model": "old",
+        "provider": "nous",
+        "requested_provider": "nous",
+        "middleware_plugins": ["jev-router"],
+        "middleware_reason": "economical/medium",
+        "reasoning_effort": "medium",
+        "reasoning_owner": "middleware",
+    }
+    session = {"agent": agent, "turn_route_binding": copy.deepcopy(old_binding)}
+    monkeypatch.setattr(server, "_persist_turn_route_state", lambda _state: False)
+    monkeypatch.setattr(
+        server,
+        "_restore_agent_model_runtime",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("restore failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="binding could not be persisted"):
+        server._apply_model_switch(
+            "sid", session, "new/model --provider nous --reasoning high --session")
+
+    assert session["agent"] is None
+    assert "rollback failed" in session["agent_error"]
+    assert session["turn_route_runtime_error"] is True
+    assert session["turn_route_binding"] == old_binding
+    assert server._read_binding(session)["status"] == "unavailable"
+
+
 def test_post_commit_finalization_failure_keeps_committed_global_switch(_quiet_switch, monkeypatch):
     agent = _Agent()
     session = {"agent": agent}

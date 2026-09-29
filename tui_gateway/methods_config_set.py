@@ -139,7 +139,8 @@ def _set_model(rid, params, key, value, session):
                 return init_err
         with _session_profile_runtime_scope(session):
             result = _apply_model_switch(sid, session, value, confirm_expensive_model=confirmed,
-                                         parsed_flags=parsed_flags)
+                                         parsed_flags=parsed_flags,
+                                         _prebuild_locked=failed_agent_init)
         if failed_agent_init and not result.get("confirm_required"):
             _restart_completed_failed_agent_build(sid, session, failed_ready)
             if init_err := _cfgset_await_agent(session, rid):

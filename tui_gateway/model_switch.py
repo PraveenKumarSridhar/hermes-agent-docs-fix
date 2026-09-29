@@ -469,6 +469,12 @@ def _apply_model_switch(
                     provider=result.target_provider,
                     model_override=candidate_override,
                     reasoning_config=selected_reasoning,
+                    resolved_runtime={
+                        "provider": result.target_provider,
+                        "requested_provider": result.target_provider,
+                        "base_url": result.base_url,
+                        "api_mode": result.api_mode,
+                    },
                 )
             else:
                 session["model_override"] = candidate_override
@@ -478,6 +484,15 @@ def _apply_model_switch(
                 _restore_agent_model_runtime(agent, rollback_snapshot)
             except Exception:
                 logger.exception("failed to roll back live model after route-binding persistence failure")
+                # The durable binding still describes the old runtime. Do not leave a
+                # mismatched live agent reachable after the compensating action fails.
+                session["agent"] = None
+                session["agent_error"] = (
+                    "model runtime rollback failed; rebuild the session agent from its durable binding"
+                )
+                session["turn_route_runtime_error"] = True
+                with contextlib.suppress(Exception):
+                    agent.close()
         if records_composer_override:
             if had_composer_profile:
                 session["composer_override_profile"] = previous_composer_profile

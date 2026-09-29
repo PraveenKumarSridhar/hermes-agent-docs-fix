@@ -4318,7 +4318,7 @@ export interface SessionTurnRouteReadResult {
   session_id: string
   stored_session_id: string
   evidence: 'session_binding'
-  status: 'pending' | 'unrecorded' | 'default' | 'routed' | 'user'
+  status: 'pending' | 'unrecorded' | 'unavailable' | 'default' | 'routed' | 'user'
   owner: 'default' | 'middleware' | 'user'
   model: string
   provider: string
