@@ -1010,6 +1010,38 @@ def test_middleware_can_preserve_profile_reasoning_across_model_change(monkeypat
     assert session["create_reasoning_override"] == {"effort": "medium"}
 
 
+def test_incompatible_preserved_reasoning_fails_open(monkeypatch):
+    session = _fresh_session()
+    session["create_reasoning_override"] = {"enabled": False}
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_turn_route_middleware",
+        lambda route, **_context: RequestMiddlewareResult(
+            payload={**route, "model": "gpt-6-astra", "preserve_reasoning": True},
+            original_payload=route,
+            changed=True,
+            trace=[{"plugin": "jev-router", "status": "routed", "reason": "strongest/manual"}],
+        ),
+    )
+    monkeypatch.setattr(server, "_load_reasoning_config", lambda _model: {"effort": "medium"})
+    monkeypatch.setattr(
+        server,
+        "_resolve_agent_model_runtime_strict",
+        lambda override, _provider: (
+            str((override or {}).get("model") or "gpt-6-sol"),
+            {"provider": "openai-codex", "requested_provider": "openai-codex"},
+        ),
+    )
+    monkeypatch.setattr(server, "_persist_turn_route_state", lambda _session: True)
+
+    binding = server._resolve_initial_turn_route("runtime", session, "route this")
+
+    assert binding["status"] == "default"
+    assert binding["model"] == "gpt-6-sol"
+    assert binding["reasoning_effort"] == "none"
+    assert binding["reasoning_owner"] == "user"
+    assert binding["middleware_plugins"] == []
+
+
 def test_preprompt_user_binding_write_failure_keeps_pending_state(monkeypatch):
     session = _fresh_session()
     switch = types.SimpleNamespace(

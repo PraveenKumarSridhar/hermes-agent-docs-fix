@@ -92,7 +92,7 @@ _methods: dict[str, callable] = {}
 _db = None
 _db_error: str | None = None
 _stdout_lock = threading.Lock()
-_cfg_lock = threading.Lock()
+_cfg_lock = threading.RLock()
 # Shared profile UI metadata is updated concurrently by Desktop, mobile and pool RPCs; its
 # compare/check/write transaction needs its own lock, not the unrelated config cache lock.
 _profile_ui_meta_lock = threading.Lock()
@@ -1298,9 +1298,9 @@ def _load_cfg() -> dict:
 def _save_cfg(cfg: dict):
     global _cfg_cache, _cfg_sig, _cfg_path
     from hermes_cli.config import atomic_config_write
-    path = _active_config_path()
-    atomic_config_write(path, cfg)
     with _cfg_lock:
+        path = _active_config_path()
+        atomic_config_write(path, cfg)
         _cfg_cache, _cfg_path = copy.deepcopy(cfg), path
         try:
             _cfg_sig = file_signature(path.stat())
@@ -1803,14 +1803,70 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
 
 def _write_config_key(key_path: str, value):
     # Write-back round-trip: raw read is mandatory — saving the overlaid/expanded view would persist it.
-    cfg = current = _load_cfg_raw()
-    *parents, leaf = key_path.split(".")
-    for key in parents:
-        if not isinstance(current.get(key), dict):
-            current[key] = {}
+    with _cfg_lock:
+        cfg = current = _load_cfg_raw()
+        *parents, leaf = key_path.split(".")
+        for key in parents:
+            if not isinstance(current.get(key), dict):
+                current[key] = {}
+            current = current[key]
+        current[leaf] = value
+        _save_cfg(cfg)
+
+
+_CFG_FIELD_MISSING = object()
+
+
+def _cfg_field(document: dict, path: tuple[str, ...]):
+    current = document
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return _CFG_FIELD_MISSING
         current = current[key]
-    current[leaf] = value
-    _save_cfg(cfg)
+    return current
+
+
+def _restore_cfg_field(document: dict, snapshot: dict, path: tuple[str, ...]) -> None:
+    current = document
+    for key in path[:-1]:
+        child = current.get(key)
+        if not isinstance(child, dict):
+            child = {}
+            current[key] = child
+        current = child
+    previous = _cfg_field(snapshot, path)
+    if previous is _CFG_FIELD_MISSING:
+        current.pop(path[-1], None)
+    else:
+        current[path[-1]] = copy.deepcopy(previous)
+
+
+def _conditional_restore_config_fields(
+    snapshot: dict,
+    attempted: dict,
+    paths: tuple[tuple[str, ...], ...],
+) -> None:
+    """Undo only fields still equal to this operation's attempted values.
+
+    Concurrent writes to unrelated fields, or newer writes to the same field,
+    survive the rollback. The read, compare, and save share the config writer lock.
+    """
+    with _cfg_lock:
+        current = _load_cfg_raw()
+        changed = False
+        for path in paths:
+            current_value = _cfg_field(current, path)
+            attempted_value = _cfg_field(attempted, path)
+            if current_value is _CFG_FIELD_MISSING or attempted_value is _CFG_FIELD_MISSING:
+                matches = current_value is attempted_value
+            else:
+                matches = current_value == attempted_value
+            if not matches:
+                continue
+            _restore_cfg_field(current, snapshot, path)
+            changed = True
+        if changed:
+            _save_cfg(current)
 
 
 _STATUSBAR_MODES = frozenset({"off", "top", "bottom"})

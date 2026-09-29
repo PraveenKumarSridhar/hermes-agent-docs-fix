@@ -9669,7 +9669,7 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     assert cfg_clamp["display"]["sections"]["thinking"] == "collapsed"
 
 
-def test_config_set_reasoning_global_scope_clears_session_override(tmp_path, monkeypatch):
+def test_config_set_reasoning_global_scope_pins_current_conversation(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
     (tmp_path / "config.yaml").write_text("agent:\n  reasoning_effort: medium\n", encoding="utf-8")
     agent = types.SimpleNamespace(reasoning_config=None)
@@ -9691,7 +9691,10 @@ def test_config_set_reasoning_global_scope_clears_session_override(tmp_path, mon
 
     assert resp["result"]["value"] == "high"
     assert server._load_cfg()["agent"]["reasoning_effort"] == "high"
-    assert "create_reasoning_override" not in server._sessions["sid"]
+    assert server._sessions["sid"]["create_reasoning_override"] == {
+        "enabled": True,
+        "effort": "high",
+    }
 
     status = server.handle_request(
         {"id": "2", "method": "config.get", "params": {"session_id": "sid", "key": "reasoning"}}

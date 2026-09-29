@@ -335,6 +335,7 @@ def _mark_turn_route_user_owned(
     model: str,
     provider: str | None,
     model_override: dict | None = None,
+    reasoning_config: dict | None = None,
 ) -> None:
     """Commit a persistent user model choice without changing one-turn/internal ownership."""
     if not isinstance(session, dict):
@@ -355,27 +356,95 @@ def _mark_turn_route_user_owned(
         except Exception:
             selected_model = str(model or "")
             runtime = {"provider": str(provider or ""), "requested_provider": str(provider or "")}
-    reasoning = getattr(agent, "reasoning_config", None) if agent is not None else session.get(
-        "create_reasoning_override")
+    explicit_reasoning = isinstance(reasoning_config, dict)
+    reasoning = reasoning_config if explicit_reasoning else (
+        getattr(agent, "reasoning_config", None) if agent is not None else session.get(
+            "create_reasoning_override")
+    )
     if not isinstance(reasoning, dict):
         reasoning = _load_reasoning_config(selected_model)
     binding = _binding(
         "user", "user", selected_model, runtime,
         reasoning_config=reasoning,
-        reasoning_owner="user" if session.get("create_reasoning_override") is not None else "default",
+        reasoning_owner=(
+            "user"
+            if explicit_reasoning or session.get("create_reasoning_override") is not None
+            else "default"
+        ),
     )
     persisted = dict(session)
     if model_override is not None:
         persisted["model_override"] = model_override
+    if explicit_reasoning:
+        # Keep this conversation pinned to the selected effort until /new clears
+        # the override. Otherwise a later global config edit can change an
+        # agentless session between selection and construction.
+        persisted["create_reasoning_override"] = reasoning
     persisted["turn_route_binding"] = binding
     persisted["turn_route_pending"] = False
     persisted["_turn_route_runtime"] = runtime
+    previous_agent_reasoning = getattr(agent, "reasoning_config", None) if agent is not None else None
+    if explicit_reasoning and agent is not None:
+        agent.reasoning_config = reasoning
     if not _persist_turn_route_state(persisted):
+        if explicit_reasoning and agent is not None:
+            agent.reasoning_config = previous_agent_reasoning
         raise RuntimeError("user turn-route binding could not be persisted")
     if model_override is not None:
         session["model_override"] = model_override
+    if explicit_reasoning:
+        session["create_reasoning_override"] = reasoning
     session["turn_route_binding"] = binding
     session["turn_route_pending"] = False
+
+
+def _mark_turn_route_reasoning_owned(
+    session: dict,
+    reasoning_config: dict,
+) -> None:
+    """Persist a user reasoning choice and its public binding in the same row write."""
+    binding = _safe_binding(session.get("turn_route_binding"))
+    if binding is None and not session.get("turn_route_pending"):
+        agent = session.get("agent")
+        override = session.get("model_override") if isinstance(session.get("model_override"), dict) else {}
+        model = str(getattr(agent, "model", None) or override.get("model") or "")
+        provider = str(
+            getattr(agent, "requested_provider", None)
+            or getattr(agent, "provider", None)
+            or override.get("provider")
+            or ""
+        )
+        binding = _binding(
+            "user", "user", model,
+            {"provider": provider, "requested_provider": provider},
+        )
+    if binding is not None:
+        binding = dict(binding)
+        binding["reasoning_effort"] = (
+            "none"
+            if reasoning_config.get("enabled") is False
+            else str(reasoning_config.get("effort") or "").strip().lower()
+        )
+        binding["reasoning_owner"] = "user"
+
+    agent = session.get("agent")
+    previous_agent_reasoning = getattr(agent, "reasoning_config", None) if agent is not None else None
+    persisted = dict(session)
+    if binding is not None:
+        persisted["turn_route_binding"] = binding
+    # Persist and retain the effective value for this bound conversation on both
+    # prebuild and live paths. /new clears the conversation pin.
+    persisted["create_reasoning_override"] = reasoning_config
+    if agent is not None:
+        agent.reasoning_config = reasoning_config
+    if not _persist_turn_route_state(persisted):
+        if agent is not None:
+            agent.reasoning_config = previous_agent_reasoning
+        raise RuntimeError("user reasoning binding could not be persisted")
+
+    session["create_reasoning_override"] = reasoning_config
+    if binding is not None:
+        session["turn_route_binding"] = binding
 
 
 def _read_binding(session: dict) -> dict:
@@ -447,6 +516,7 @@ def register(server) -> None:
 __all__ = [
     "TURN_ROUTE_BINDING_SCHEMA_VERSION",
     "_arm_initial_turn_route",
+    "_mark_turn_route_reasoning_owned",
     "_mark_turn_route_user_owned",
     "_resolve_initial_turn_route",
 ]

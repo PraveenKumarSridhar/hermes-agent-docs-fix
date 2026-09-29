@@ -95,9 +95,18 @@ def resolve_turn_route(
         selected_reasoning = reasoning_config
         reasoning_owner = "user" if preserve_reasoning else "default"
         retain_reasoning = preserve_reasoning or result.payload.get("preserve_reasoning") is True
-        if not retain_reasoning and "reasoning_effort" in result.payload:
+        from agent.reasoning_effort import route_supported_efforts
+
+        if retain_reasoning and isinstance(selected_reasoning, dict):
+            effort = (
+                "none"
+                if selected_reasoning.get("enabled") is False
+                else str(selected_reasoning.get("effort") or "").strip().lower()
+            )
+            if effort and effort not in route_supported_efforts(selected_provider, selected_model):
+                raise ValueError("preserved reasoning effort is unsupported by the selected route")
+        elif "reasoning_effort" in result.payload:
             effort = str(result.payload.get("reasoning_effort") or "").strip().lower()
-            from agent.reasoning_effort import route_supported_efforts
             from hermes_constants import parse_reasoning_effort
 
             if effort not in route_supported_efforts(selected_provider, selected_model):

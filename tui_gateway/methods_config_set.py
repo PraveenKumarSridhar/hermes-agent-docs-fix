@@ -4,7 +4,9 @@ are rebound onto server.py's globals (method_ctx.bind_module) and reference them
 Keys match exactly except ``details_mode.<section>`` (prefix) and ``_DISPLAY_TOGGLE_KEYS``.
 """
 
+import copy
 import os
+import threading
 
 from hermes_constants import INDICATOR_STYLES
 
@@ -315,21 +317,60 @@ def _set_reasoning(rid, params, key, value, session):
     parsed = parse_reasoning_effort(arg)
     if parsed is None:
         return _err(rid, 4002, f"unknown reasoning value: {value}")
-    if scope == "global" or session is None:
-        _write_config_key("agent.reasoning_effort", arg)
-        if session is not None:
-            # /new is a full conversation boundary: session-scoped runtime overrides (/model, /reasoning,
-            # /fast) do NOT carry forward — the fresh agent re-derives model/provider, reasoning, and
-            # service tier from config.yaml (#48055, #23131). Session pins are cleared below so a rebuild
-            # can't resurrect them. (Global process state is still never touched — see the
-            # cross-session-contamination note in _apply_model_switch.)
-            session.pop("create_reasoning_override", None)
-    else:  # session-scoped like the gateway's `/reasoning <level>`; a menu pick must not rewrite the global
-        session["create_reasoning_override"] = parsed
-    if session and session.get("agent") is not None:
-        session["agent"].reasoning_config = parsed
-        _persist_live_session_runtime(session)
-        _emit_session_info(params.get("session_id", ""), session)
+    global_scope = scope == "global" or session is None
+    config_snapshot = None
+    attempted_config = None
+    try:
+        while session is not None:
+            with session.setdefault("agent_build_lock", threading.Lock()):
+                build_inflight = session.get("agent") is None and session.get("agent_build_started")
+                ready = session.get("agent_ready") if build_inflight else None
+                if build_inflight and ready is None:
+                    raise ValueError("agent initialization state is missing its completion signal")
+                if ready is None:
+                    if global_scope:
+                        with _cfg_lock:
+                            config_snapshot = _load_cfg_raw()
+                            attempted_config = copy.deepcopy(config_snapshot)
+                            agent_config = attempted_config.get("agent")
+                            agent_config = dict(agent_config) if isinstance(agent_config, dict) else {}
+                            agent_config["reasoning_effort"] = arg
+                            attempted_config["agent"] = agent_config
+                            _save_cfg(attempted_config)
+                    _mark_turn_route_reasoning_owned(session, parsed)
+                    break
+            if ready is not None:
+                if not ready.wait(timeout=30.0):
+                    raise ValueError("agent initialization did not finish before reasoning selection")
+                if session.get("agent") is None:
+                    raise ValueError(session.get("agent_error") or "agent initialization failed")
+        if session is None and global_scope:
+            with _cfg_lock:
+                config_snapshot = _load_cfg_raw()
+                attempted_config = copy.deepcopy(config_snapshot)
+                agent_config = attempted_config.get("agent")
+                agent_config = dict(agent_config) if isinstance(agent_config, dict) else {}
+                agent_config["reasoning_effort"] = arg
+                attempted_config["agent"] = agent_config
+                _save_cfg(attempted_config)
+    except Exception as exc:
+        if config_snapshot is not None and attempted_config is not None:
+            try:
+                _conditional_restore_config_fields(
+                    config_snapshot,
+                    attempted_config,
+                    (("agent", "reasoning_effort"),),
+                )
+            except Exception as rollback_exc:
+                raise RuntimeError(
+                    f"reasoning update failed and config rollback failed: {rollback_exc}"
+                ) from exc
+        raise
+    if session is not None:
+        try:
+            _emit_session_info(params.get("session_id", ""), session)
+        except Exception:
+            logger.debug("failed to emit session info after reasoning commit", exc_info=True)
     return _kv(rid, key, arg)
 
 
